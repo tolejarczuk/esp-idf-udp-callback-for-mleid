@@ -10,7 +10,7 @@
  * Unless required by applicable law or agreed to in writing, this
  * software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
  * CONDITIONS OF ANY KIND, either express or implied.
-*/
+ */
 
 #include <stdio.h>
 #include <unistd.h>
@@ -38,6 +38,9 @@
 #include "openthread/instance.h"
 #include "openthread/logging.h"
 #include "openthread/tasklet.h"
+#include "openthread/thread.h"
+#include "openthread/udp.h"
+#include "openthread/ip6.h"
 
 #if CONFIG_OPENTHREAD_STATE_INDICATOR_ENABLE
 #include "ot_led_strip.h"
@@ -48,6 +51,133 @@
 #endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
 
 #define TAG "ot_esp_cli"
+
+#define UDP_PORT 12345
+
+static otUdpSocket sUdpSocket;
+static bool sUdpServerInitialized = false;
+
+static void udp_receive_callback(void *aContext, otMessage *aMessage, const otMessageInfo *aMessageInfo)
+{
+    otInstance *instance = (otInstance *)aContext;
+    char buffer[128];
+    uint16_t length = otMessageGetLength(aMessage);
+    uint16_t offset = otMessageGetOffset(aMessage);
+
+    if (length - offset > sizeof(buffer) - 1)
+    {
+        length = sizeof(buffer) - 1 + offset;
+    }
+
+    otMessageRead(aMessage, offset, buffer, length - offset);
+    buffer[length - offset] = '\0';
+
+    ESP_LOGI(TAG, "Received UDP message: %s", buffer);
+
+    // Handle GET_MLEID command
+    if (strcmp(buffer, "GET_MLEID") == 0)
+    {
+        const otIp6Address *mlEid = otThreadGetMeshLocalEid(instance);
+        char response[64];
+        char ml_eid_str[40];
+        otIp6AddressToString(mlEid, ml_eid_str, sizeof(ml_eid_str));
+        sprintf(response, "MLEID:%s", ml_eid_str);
+
+        ESP_LOGI(TAG, "Sending response: %s", response);
+
+        // Send UDP response back to sender
+        otMessage *responseMessage = otUdpNewMessage(instance, NULL);
+        if (responseMessage != NULL)
+        {
+            otMessageAppend(responseMessage, response, strlen(response));
+
+            otMessageInfo messageInfo = *aMessageInfo;
+            memcpy(&messageInfo.mPeerAddr, &aMessageInfo->mPeerAddr, sizeof(otIp6Address));
+            messageInfo.mPeerPort = aMessageInfo->mPeerPort;
+
+            otError error = otUdpSend(instance, &sUdpSocket, responseMessage, &messageInfo);
+            if (error != OT_ERROR_NONE)
+            {
+                ESP_LOGE(TAG, "Failed to send UDP response: %d", error);
+                otMessageFree(responseMessage);
+            }
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Failed to create UDP response message");
+        }
+    }
+}
+
+static void setup_udp_server(otInstance *instance)
+{
+    if (sUdpServerInitialized)
+    {
+        return;
+    }
+
+    otSockAddr sockaddr;
+    memset(&sockaddr, 0, sizeof(sockaddr));
+    sockaddr.mPort = UDP_PORT;
+
+    ESP_LOGI(TAG, "Setting up UDP server on port %d...", UDP_PORT);
+
+    otError error = otUdpOpen(instance, &sUdpSocket, udp_receive_callback, instance);
+    if (error != OT_ERROR_NONE)
+    {
+        ESP_LOGE(TAG, "Failed to open UDP socket: %d", error);
+        return;
+    }
+
+    error = otUdpBind(instance, &sUdpSocket, &sockaddr, OT_NETIF_THREAD_HOST);
+    if (error != OT_ERROR_NONE)
+    {
+        ESP_LOGE(TAG, "Failed to bind UDP socket on port %d: error=%d", UDP_PORT, error);
+        otUdpClose(instance, &sUdpSocket);
+        return;
+    }
+
+    sUdpServerInitialized = true;
+    ESP_LOGI(TAG, "UDP server successfully listening on port %d", UDP_PORT);
+}
+
+static void ot_state_changed_callback(otChangedFlags aFlags, void *aContext)
+{
+    otInstance *instance = (otInstance *)aContext;
+
+    ESP_LOGI(TAG, "State changed, flags: 0x%08lx", aFlags);
+
+    if (aFlags & OT_CHANGED_THREAD_ROLE)
+    {
+        otDeviceRole role = otThreadGetDeviceRole(instance);
+        const char *roleStr = "Unknown";
+        switch (role)
+        {
+        case OT_DEVICE_ROLE_DISABLED:
+            roleStr = "Disabled";
+            break;
+        case OT_DEVICE_ROLE_DETACHED:
+            roleStr = "Detached";
+            break;
+        case OT_DEVICE_ROLE_CHILD:
+            roleStr = "Child";
+            break;
+        case OT_DEVICE_ROLE_ROUTER:
+            roleStr = "Router";
+            break;
+        case OT_DEVICE_ROLE_LEADER:
+            roleStr = "Leader";
+            break;
+        }
+        ESP_LOGI(TAG, "Thread role changed to: %s (%d)", roleStr, role);
+
+        // Set up UDP server once we have a valid role (child, router, or leader)
+        if (role >= OT_DEVICE_ROLE_CHILD && !sUdpServerInitialized)
+        {
+            setup_udp_server(instance);
+        }
+    }
+}
 
 static esp_netif_t *init_openthread_netif(const esp_openthread_platform_config_t *config)
 {
@@ -92,13 +222,44 @@ static void ot_task_worker(void *aContext)
     esp_cli_custom_command_init();
 #endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
 
+    // Register state change callback for UDP server initialization
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otInstance *instance = esp_openthread_get_instance();
+    otSetStateChangedCallback(instance, ot_state_changed_callback, instance);
+
+    // Log current Thread state
+    otDeviceRole role = otThreadGetDeviceRole(instance);
+    bool isEnabled = otThreadGetDeviceRole(instance) != OT_DEVICE_ROLE_DISABLED;
+    ESP_LOGI(TAG, "Initial Thread state - Role: %d, Enabled: %d", role, isEnabled);
+
+    // Check if we have a stored dataset
+    otOperationalDatasetTlvs activeDataset;
+    otError error = otDatasetGetActiveTlvs(instance, &activeDataset);
+    if (error == OT_ERROR_NONE)
+    {
+        ESP_LOGI(TAG, "Active dataset found, enabling Thread...");
+
+        // Enable IPv6 and Thread
+        error = otIp6SetEnabled(instance, true);
+        ESP_LOGI(TAG, "otIp6SetEnabled result: %d", error);
+
+        error = otThreadSetEnabled(instance, true);
+        ESP_LOGI(TAG, "otThreadSetEnabled result: %d", error);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "No active dataset found (error: %d). Use CLI to configure network.", error);
+    }
+
+    esp_openthread_lock_release();
+
     // Run the main loop
 #if CONFIG_OPENTHREAD_CLI
     esp_openthread_cli_create_task();
 #endif
 #if CONFIG_OPENTHREAD_AUTO_START
     otOperationalDatasetTlvs dataset;
-    otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
+    error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
     ESP_ERROR_CHECK(esp_openthread_auto_start((error == OT_ERROR_NONE) ? &dataset : NULL));
 #endif
     esp_openthread_launch_mainloop();
