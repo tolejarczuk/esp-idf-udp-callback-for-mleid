@@ -53,9 +53,107 @@
 #define TAG "ot_esp_cli"
 
 #define UDP_PORT 12345
+#define LED_BLINK_COUNT 25
+#define LED_BLINK_DELAY_MS 200
 
 static otUdpSocket sUdpSocket;
 static bool sUdpServerInitialized = false;
+
+typedef struct
+{
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+    uint8_t alpha;
+    char effect[32];
+} led_color_command_t;
+
+static otInstance *sOtInstance = NULL;
+
+#if CONFIG_OPENTHREAD_STATE_INDICATOR_ENABLE
+static void led_blink_task(void *pvParameters)
+{
+    led_color_command_t *cmd = (led_color_command_t *)pvParameters;
+
+    ESP_LOGI(TAG, "Starting LED blink with color R:%d G:%d B:%d, effect: %s",
+             cmd->red, cmd->green, cmd->blue, cmd->effect);
+
+    // Blink the LED with the specified color
+    for (int i = 0; i < LED_BLINK_COUNT; i++)
+    {
+        esp_openthread_state_indicator_set(0, cmd->red, cmd->green, cmd->blue);
+        vTaskDelay(pdMS_TO_TICKS(LED_BLINK_DELAY_MS));
+        esp_openthread_state_indicator_clear();
+        vTaskDelay(pdMS_TO_TICKS(LED_BLINK_DELAY_MS));
+    }
+
+    // Return to normal state indicator (role-based LED)
+    if (sOtInstance != NULL)
+    {
+        esp_openthread_lock_acquire(portMAX_DELAY);
+        otDeviceRole role = otThreadGetDeviceRole(sOtInstance);
+        esp_openthread_lock_release();
+
+        ESP_LOGI(TAG, "LED blink complete, returning to role indicator (role: %d)", role);
+
+        // Manually set the LED back to the role color
+        switch (role)
+        {
+        case OT_DEVICE_ROLE_DISABLED:
+            esp_openthread_state_indicator_clear();
+            break;
+        case OT_DEVICE_ROLE_DETACHED:
+            esp_openthread_state_indicator_set(0, CONFIG_DETACHED_INDICATOR_RED, CONFIG_DETACHED_INDICATOR_GREEN, CONFIG_DETACHED_INDICATOR_BLUE);
+            break;
+        case OT_DEVICE_ROLE_LEADER:
+            esp_openthread_state_indicator_set(0, CONFIG_LEADER_INDICATOR_RED, CONFIG_LEADER_INDICATOR_GREEN, CONFIG_LEADER_INDICATOR_BLUE);
+            break;
+        case OT_DEVICE_ROLE_ROUTER:
+            esp_openthread_state_indicator_set(0, CONFIG_ROUTER_INDICATOR_RED, CONFIG_ROUTER_INDICATOR_GREEN, CONFIG_ROUTER_INDICATOR_BLUE);
+            break;
+        case OT_DEVICE_ROLE_CHILD:
+            esp_openthread_state_indicator_set(0, CONFIG_CHILD_INDICATOR_RED, CONFIG_CHILD_INDICATOR_GREEN, CONFIG_CHILD_INDICATOR_BLUE);
+            break;
+        default:
+            esp_openthread_state_indicator_clear();
+            break;
+        }
+    }
+
+    free(cmd);
+    vTaskDelete(NULL);
+}
+
+static bool parse_color_command(const char *message, led_color_command_t *cmd)
+{
+    // Expected format: "R.G.B.A:EFFECT" (e.g., "0.128.0.0:BOMBA")
+    int r, g, b, a;
+    char effect[32];
+
+    // Parse the message
+    int parsed = sscanf(message, "%d.%d.%d.%d:%31s", &r, &g, &b, &a, effect);
+
+    if (parsed != 5)
+    {
+        return false;
+    }
+
+    // Validate color values (0-255)
+    if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255 || a < 0 || a > 255)
+    {
+        return false;
+    }
+
+    cmd->red = (uint8_t)r;
+    cmd->green = (uint8_t)g;
+    cmd->blue = (uint8_t)b;
+    cmd->alpha = (uint8_t)a;
+    strncpy(cmd->effect, effect, sizeof(cmd->effect) - 1);
+    cmd->effect[sizeof(cmd->effect) - 1] = '\0';
+
+    return true;
+}
+#endif
 
 static void udp_receive_callback(void *aContext, otMessage *aMessage, const otMessageInfo *aMessageInfo)
 {
@@ -73,6 +171,31 @@ static void udp_receive_callback(void *aContext, otMessage *aMessage, const otMe
     buffer[length - offset] = '\0';
 
     ESP_LOGI(TAG, "Received UDP message: %s", buffer);
+
+#if CONFIG_OPENTHREAD_STATE_INDICATOR_ENABLE
+    // Try to parse as color command first
+    led_color_command_t temp_cmd;
+    if (parse_color_command(buffer, &temp_cmd))
+    {
+        ESP_LOGI(TAG, "Parsed color command: R:%d G:%d B:%d A:%d Effect:%s",
+                 temp_cmd.red, temp_cmd.green, temp_cmd.blue, temp_cmd.alpha, temp_cmd.effect);
+
+        // Allocate memory for the task parameter
+        led_color_command_t *cmd = malloc(sizeof(led_color_command_t));
+        if (cmd != NULL)
+        {
+            memcpy(cmd, &temp_cmd, sizeof(led_color_command_t));
+
+            // Create a task to handle LED blinking
+            xTaskCreate(led_blink_task, "led_blink", 2048, cmd, 5, NULL);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Failed to allocate memory for LED command");
+        }
+        return; // Don't process other commands
+    }
+#endif
 
     // Handle GET_MLEID command
     if (strcmp(buffer, "GET_MLEID") == 0)
@@ -225,6 +348,7 @@ static void ot_task_worker(void *aContext)
     // Register state change callback for UDP server initialization
     esp_openthread_lock_acquire(portMAX_DELAY);
     otInstance *instance = esp_openthread_get_instance();
+    sOtInstance = instance; // Store instance globally for LED control
     otSetStateChangedCallback(instance, ot_state_changed_callback, instance);
 
     // Log current Thread state
